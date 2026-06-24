@@ -1,0 +1,159 @@
+name: Build iperf3 for HarmonyOS (OHOS)
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'configure.ac'
+      - 'configure'
+      - 'Makefile.am'
+      - '.github/workflows/build-ohos.yml'
+  workflow_dispatch:
+
+env:
+  # OpenHarmony SDK (pinned). Update these to use a newer SDK version.
+  # Browse available builds: https://ci.openharmony.cn/workbench/cicd/dailybuild/dailylist
+  OHOS_SDK_VERSION: "20250819_020817"
+  OHOS_SDK_URL: >-
+    https://cidownload.openharmony.cn/version/Master_Version/ohos-sdk-full_ohos/20250819_020817/version-Master_Version-ohos-sdk-full_ohos-20250819_020817-ohos-sdk-full_ohos.tar.gz
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache OHOS Native SDK
+        id: cache-ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ohos-ndk
+          key: ohos-ndk-${{ env.OHOS_SDK_VERSION }}
+
+      - name: Download & extract OHOS Native SDK
+        if: steps.cache-ndk.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+
+          echo "::group::Download OHOS SDK"
+          curl -fSL --retry 3 --connect-timeout 120 -o ohos-sdk.tar.gz "$OHOS_SDK_URL"
+          echo "::endgroup::"
+
+          echo "::group::Extract native SDK component"
+          mkdir -p _extract
+          tar -xzf ohos-sdk.tar.gz -C _extract
+          native_zip=$(find _extract -name 'native-linux-x64-*.zip' | head -1)
+          if [ -z "$native_zip" ]; then
+            echo "ERROR: native-linux-x64-*.zip not found in SDK tarball"
+            find _extract -name '*.zip' -printf '  %p\n'
+            exit 1
+          fi
+          echo "Found: $native_zip"
+          unzip -qo "$native_zip" -d ohos-ndk
+          echo "::endgroup::"
+
+          # Fix sysroot lib paths (some build systems expect libs directly in usr/lib/)
+          if [ -d ohos-ndk/native/sysroot/usr/lib/aarch64-linux-ohos ]; then
+            cp -an ohos-ndk/native/sysroot/usr/lib/aarch64-linux-ohos/* \
+                   ohos-ndk/native/sysroot/usr/lib/ 2>/dev/null || true
+          fi
+
+          rm -rf ohos-sdk.tar.gz _extract
+          echo "NDK ready at $RUNNER_TEMP/ohos-ndk/native"
+          ls "$RUNNER_TEMP/ohos-ndk/native/"
+
+      - name: Cross-compile iperf3 for aarch64-linux-ohos
+        run: |
+          set -euo pipefail
+          NDK="${RUNNER_TEMP}/ohos-ndk/native"
+
+          export CC="${NDK}/llvm/bin/clang"
+          export AR="${NDK}/llvm/bin/llvm-ar"
+          export RANLIB="${NDK}/llvm/bin/llvm-ranlib"
+          export STRIP="${NDK}/llvm/bin/llvm-strip"
+          export CFLAGS="--target=aarch64-linux-ohos --sysroot=${NDK}/sysroot -O2 -Wall"
+          export LDFLAGS="--target=aarch64-linux-ohos --sysroot=${NDK}/sysroot"
+
+          ./configure \
+            --build=x86_64-linux-gnu \
+            --host=aarch64-linux-ohos \
+            --without-openssl \
+            --without-sctp \
+            --enable-static-bin \
+            --without-ldconfig \
+            --prefix=/usr
+
+          make -j"$(nproc)" V=1
+
+          echo "=== Build result ==="
+          IPERF_BIN=src/iperf3
+          [ -f src/.libs/iperf3 ] && IPERF_BIN=src/.libs/iperf3
+          file "$IPERF_BIN"
+          echo "IPERF_BIN=$IPERF_BIN" >> "$GITHUB_ENV"
+
+      - name: Create HNP package
+        run: |
+          set -euo pipefail
+          NDK="${RUNNER_TEMP}/ohos-ndk/native"
+          STRIP="${NDK}/llvm/bin/llvm-strip"
+
+          VERSION=$(sed -n 's/.*AC_INIT(\[iperf\],\[\([^]]*\)\],.*/\1/p' configure.ac)
+          # Sanitize version for HNP (remove trailing + etc.)
+          HNP_VERSION=$(echo "$VERSION" | sed 's/[^0-9.]//g')
+
+          mkdir -p hnp-staging/bin
+          cp "$IPERF_BIN" hnp-staging/bin/iperf3
+          "$STRIP" hnp-staging/bin/iperf3
+
+          printf '{\n  "type": "hnp-config",\n  "name": "iperf3",\n  "version": "%s",\n  "install": {\n    "links": [\n      { "source": "bin/iperf3", "target": "iperf3" }\n    ]\n  }\n}\n' "$HNP_VERSION" > hnp-staging/hnp.json
+
+          cd hnp-staging
+          zip -r "../iperf3-${HNP_VERSION}-aarch64-ohos.hnp" .
+          cd ..
+
+          echo "=== HNP package ==="
+          ls -lh iperf3-*.hnp
+          unzip -l iperf3-*.hnp
+          echo "HNP_FILE=iperf3-${HNP_VERSION}-aarch64-ohos.hnp" >> "$GITHUB_ENV"
+          echo "HNP_VERSION=${HNP_VERSION}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iperf3-ohos-aarch64
+          path: iperf3-*.hnp
+          if-no-files-found: error
+
+      - name: Publish release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha7="${GITHUB_SHA::7}"
+          tag="ohos-v${HNP_VERSION}"
+
+          dst="${RUNNER_TEMP}/${HNP_FILE%.hnp}-${sha7}.hnp"
+          cp "$HNP_FILE" "$dst"
+
+          gh release delete "$tag" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          notes="Cross-compiled iperf3 for HarmonyOS NEXT (aarch64).
+
+          ## Install via hdc
+          \`\`\`bash
+          hdc file send iperf3-*.hnp /data/local/tmp/
+          hdc shell hnp install /data/local/tmp/iperf3-*.hnp
+          # or run directly:
+          hdc shell chmod +x /data/local/tmp/iperf3 && hdc shell /data/local/tmp/iperf3 -v
+          \`\`\`"
+
+          gh release create "$tag" "$dst" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "iperf3 ${HNP_VERSION} for HarmonyOS (${sha7})" \
+            --prerelease \
+            --notes "$notes"
