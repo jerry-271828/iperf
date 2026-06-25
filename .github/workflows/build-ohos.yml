@@ -8,6 +8,7 @@ on:
       - 'configure.ac'
       - 'configure'
       - 'Makefile.am'
+      - 'harmony/**'
       - '.github/workflows/build-ohos.yml'
   workflow_dispatch:
 
@@ -17,6 +18,9 @@ env:
   OHOS_SDK_VERSION: "20250819_020817"
   OHOS_SDK_URL: >-
     https://cidownload.openharmony.cn/version/Master_Version/ohos-sdk-full_ohos/20250819_020817/version-Master_Version-ohos-sdk-full_ohos-20250819_020817-ohos-sdk-full_ohos.tar.gz
+  # HarmonyOS Command-Line Tools (for HAP build)
+  CLT_BASE_URL: https://github.com/jerry-271828/harmonyos-commandline-tools/releases/download/v26.0.0.461
+  CLT_SHA256: b046da0a1a06fe13b3d82d198738abc54788d79c6c9d07c36617ec7fc31a3b3b
 
 permissions:
   contents: write
@@ -132,6 +136,86 @@ jobs:
           path: iperf3-*.hnp
           if-no-files-found: error
 
+      # ── HAP build (wraps iperf3 binary in an installable HarmonyOS app) ──
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache HarmonyOS CLI tools
+        id: cache-clt
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/command-line-tools
+          key: harmonyos-clt-v26.0.0.461
+
+      - name: Download HarmonyOS CLI tools
+        if: steps.cache-clt.outputs.cache-hit != 'true'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -O "$CLT_BASE_URL/clt.zip.part00" -O "$CLT_BASE_URL/clt.zip.part01"
+          cat clt.zip.part00 clt.zip.part01 > clt.zip
+          rm -f clt.zip.part00 clt.zip.part01
+          echo "$CLT_SHA256  clt.zip" | sha256sum -c
+          unzip -q clt.zip
+          rm -f clt.zip
+
+      - name: Prepare HAP project
+        run: |
+          set -euo pipefail
+          CLT="${RUNNER_TEMP}/command-line-tools"
+          echo "$CLT/bin" >> "$GITHUB_PATH"
+          echo "$CLT/tool/node/bin" >> "$GITHUB_PATH"
+          echo "DEVECO_SDK_HOME=$CLT/sdk" >> "$GITHUB_ENV"
+
+          # Copy iperf3 binary into rawfile
+          mkdir -p harmony/entry/src/main/resources/rawfile
+          NDK="${RUNNER_TEMP}/ohos-ndk/native"
+          cp "$IPERF_BIN" harmony/entry/src/main/resources/rawfile/iperf3
+          "${NDK}/llvm/bin/llvm-strip" harmony/entry/src/main/resources/rawfile/iperf3
+
+          # Generate build-profile.json5 for CI SDK version
+          printf '%s\n' '{' \
+            '  "app": {' \
+            '    "signingConfigs": [],' \
+            '    "products": [{' \
+            '      "name": "default",' \
+            '      "signingConfig": "default",' \
+            '      "compileSdkVersion": "26.0.0(26.0.0)",' \
+            '      "compatibleSdkVersion": "5.0.0(12)",' \
+            '      "targetSdkVersion": "26.0.0(26.0.0)",' \
+            '      "runtimeOS": "HarmonyOS"' \
+            '    }],' \
+            '    "buildModeSet": [{"name":"debug"},{"name":"release"}]' \
+            '  },' \
+            '  "modules": [{' \
+            '    "name": "entry",' \
+            '    "srcPath": "./entry",' \
+            '    "targets": [{"name":"default","applyToProducts":["default"]}]' \
+            '  }]' \
+            '}' > harmony/build-profile.json5
+
+      - name: Build HAP
+        working-directory: harmony
+        run: |
+          ohpm config set registry https://ohpm.openharmony.cn/ohpm/
+          ohpm install --all
+          hvigorw --mode module -p product=default -p buildMode=release assembleHap --no-daemon
+
+      - name: Collect HAP artifact
+        run: |
+          hap=$(find harmony/entry/build -name '*.hap' | head -1)
+          if [ -z "$hap" ]; then echo "ERROR: no .hap found"; exit 1; fi
+          cp "$hap" "iperf3-${HNP_VERSION}-aarch64-ohos.hap"
+          echo "HAP_FILE=iperf3-${HNP_VERSION}-aarch64-ohos.hap" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iperf3-ohos-hap
+          path: iperf3-*.hap
+          if-no-files-found: error
+
       - name: Publish release
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         env:
@@ -141,21 +225,32 @@ jobs:
           sha7="${GITHUB_SHA::7}"
           tag="ohos-v${HNP_VERSION}"
 
-          dst="${RUNNER_TEMP}/${HNP_FILE%.hnp}-${sha7}.hnp"
-          cp "$HNP_FILE" "$dst"
+          dst_hnp="${RUNNER_TEMP}/${HNP_FILE%.hnp}-${sha7}.hnp"
+          cp "$HNP_FILE" "$dst_hnp"
+          dst_hap="${RUNNER_TEMP}/${HAP_FILE%.hap}-${sha7}.hap"
+          cp "$HAP_FILE" "$dst_hap" 2>/dev/null || true
 
           gh release delete "$tag" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+
+          assets=("$dst_hnp")
+          [ -f "$dst_hap" ] && assets+=("$dst_hap")
+
           notes="Cross-compiled iperf3 for HarmonyOS NEXT (aarch64).
 
-          ## Install via hdc
+          ## Install via HAP
+          \`\`\`bash
+          hdc install iperf3-*.hap
+          # Launch app to extract binary, then:
+          hdc shell /data/app/el2/100/base/com.iperf3.tool/haps/entry/files/iperf3 -v
+          \`\`\`
+
+          ## Install via HNP (standalone)
           \`\`\`bash
           hdc file send iperf3-*.hnp /data/local/tmp/
           hdc shell hnp install /data/local/tmp/iperf3-*.hnp
-          # or run directly:
-          hdc shell chmod +x /data/local/tmp/iperf3 && hdc shell /data/local/tmp/iperf3 -v
           \`\`\`"
 
-          gh release create "$tag" "$dst" \
+          gh release create "$tag" "${assets[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "iperf3 ${HNP_VERSION} for HarmonyOS (${sha7})" \

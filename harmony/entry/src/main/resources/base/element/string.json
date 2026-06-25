@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "iperf3 network performance tool"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "iperf3"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "iperf3"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "name": "entry",
+  "version": "3.21.0",
+  "description": "iperf3 tool entry module",
+  "main": "",
+  "author": "",
+  "license": "BSD-3-Clause",
+  "dependencies": {}
+}
