@@ -79,6 +79,9 @@ jobs:
           export CFLAGS="--target=aarch64-linux-ohos --sysroot=${NDK}/sysroot -O2 -Wall"
           export LDFLAGS="--target=aarch64-linux-ohos --sysroot=${NDK}/sysroot"
 
+          # OHOS sysroot: linux/tcp.h pulls in linux/socket.h which
+          # redefines sockaddr_storage (conflicts with sys/socket.h).
+          # Force configure to skip linux/tcp.h so netinet/tcp.h is used.
           ./configure \
             --build=x86_64-linux-gnu \
             --host=aarch64-linux-ohos \
@@ -86,7 +89,8 @@ jobs:
             --without-sctp \
             --enable-static-bin \
             --without-ldconfig \
-            --prefix=/usr
+            --prefix=/usr \
+            ac_cv_header_linux_tcp_h=no
 
           make -j"$(nproc)" V=1
 
