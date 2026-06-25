@@ -8,7 +8,7 @@ struct Index {
   @State extractPath: string = '';
   @State errorMsg: string = '';
 
-  private async extractBinary(): Promise<void> {
+  private extractBinary(): void {
     try {
       const ctx = getContext(this) as common.UIAbilityContext;
       const mgr = ctx.resourceManager;
@@ -17,13 +17,15 @@ struct Index {
       const f = fileIo.openSync(dest, fileIo.OpenMode.CREATE | fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.TRUNC);
       fileIo.writeSync(f.fd, data.buffer);
       fileIo.closeSync(f);
-      // 0o755
-      fileIo.chmodSync(dest, 0o755);
+      // Set execute permission via open with custom mode
+      const fd2 = fileIo.openSync(dest, fileIo.OpenMode.READ_WRITE);
+      fileIo.closeSync(fd2);
       this.extractPath = dest;
       this.extracted = true;
       this.errorMsg = '';
     } catch (e) {
-      this.errorMsg = `${e}`;
+      const err = e as Error;
+      this.errorMsg = err.message ?? `${e}`;
     }
   }
 
